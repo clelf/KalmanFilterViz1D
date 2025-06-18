@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 
 def process_dynamics(A, Q, T, x0, s0):
-    # Generate the true state (no noise)
+    # Generate the process's true states with noise of var Q
     true_state = np.zeros(T)
     true_state[0] = x0
 
@@ -21,7 +21,7 @@ def process_dynamics(A, Q, T, x0, s0):
     return true_state, true_mean, true_var
 
 def observ_dynamics(true_state, R, T):
-    # Generate noisy observations (measurements)
+    # Generate observations (measurements) with noise of var R
     measurements = np.zeros(T)
     obs_mean = np.zeros(T)
     obs_var = np.zeros(T)
@@ -50,7 +50,7 @@ def kalman(measurements, A, Q, R, x0, s0):
         # Update step (Kalman Gain)
         K = s_pred / (s_pred + R)
         x_est[t] = x_pred + K * (measurements[t] - x_pred)
-        s_est[t] = (1 - K) * s_pred  # Update the estimation
+        s_est[t] = (1 - K) * s_pred 
 
     return x_est, s_est
 
@@ -72,8 +72,8 @@ if __name__=='__main__':
     A = 1  # State transition matrix
     Q = 0.1  # Process noise covariance
     R = 1  # Measurement noise covariance
-    x0 = 0.0  # Initial state
-    s0 = 2
+    x0 = 0.0  # Initial state mean
+    s0 = 2 # Initial state var
     T = 50  # Number of time steps
 
     # Generate data
