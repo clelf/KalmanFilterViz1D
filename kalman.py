@@ -1,8 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-# TODO: rewrite dynamics in terms of tau and d instead of a and b
-# TODO: how to define A
+
 
 def process_dynamics_A(A, B, Q, T, x0, s0):
     # Generate the process's states with noise of var Q
@@ -50,7 +49,7 @@ def observ_dynamics(process_state, C, R, T):
     obs_var = np.zeros(T)
 
     for t in range(0, T):
-        measurements[t] = C * obs_mean[t] + np.random.normal(0, np.sqrt(obs_var[t]))
+        measurements[t] = C * process_state[t] + np.random.normal(0, np.sqrt(obs_var[t]))
 
         obs_mean[t] = C * process_state[t]
         obs_var[t] = R
@@ -99,10 +98,10 @@ def kalman_tau(measurements, tau, x_lim, C, Q, R, x0):
 
     return x_est, s_est
 
-def kalman_batch(ys, parsets, C, Q, R, x0s):
+def kalman_batch(ys, taus, mu_lims, C, Qs, R, x0s):
     y_hats, s_hats = [], []
-    for y, parset, y0 in zip(ys, parsets, x0s):
-        y_hat, s_hat = kalman_tau(y, *parset, C, Q, R, y0)
+    for y, tau, mu_lim, Q, y0 in zip(ys, taus, mu_lims, Qs, x0s):
+        y_hat, s_hat = kalman_tau(y, tau, mu_lim, C, Q, R, y0)
         y_hats.append(y_hat)
         s_hats.append(s_hat)
     return np.stack([batch for batch in y_hats], axis=0), np.stack([batch for batch in s_hats], axis=0)
