@@ -63,7 +63,7 @@ if __name__=='__main__':
     axs[0].plot(taus, mu_estimates, label='Kalman mu_hat', color='black', linestyle='--', marker='o') 
     axs[0].fill_between(taus, np.array(mu_estimates)-np.array(mu_estimates_std), np.array(mu_estimates)+np.array(mu_estimates_std), color='black', alpha=0.2)
     axs[0].set_xlabel('taus')
-    axs[0].set_ylabel('mu_hat')
+    axs[0].set_ylabel('mu_hat (err=std)')
     axs[0].set_xscale('log')
     axs[0].legend()
 
@@ -75,7 +75,7 @@ if __name__=='__main__':
     axs[1].set_ylabel('RMSE (err=SEM)')
 
     # Add title to overall figure mentioning N_test
-    axs[0].set_title(f'Simulations per tau value ={N_test}')
+    axs[0].set_title(f'Simulations per tau value = {N_test}')
     plt.show()
 
 
