@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-
+from pykalman import KalmanFilter
 
 
 def process_dynamics_A(A, B, Q, T, x0, s0):
@@ -83,7 +83,7 @@ def kalman_tau(measurements, tau, x_lim, C, Q, R, x0):
     # Kalman filter initialization
     x_est = np.zeros(T)  # Estimated states mean
     s_est = np.zeros(T)  # Estimated states variance
-    x_est[0] = x0  # Start with the initial estimate
+    x_est[0] = x0  # Start with the initial estimate # TODO: or the mean of the last measurements ~ stationary value
     s_est[0] = 0
 
     for t in range(1, T):
@@ -98,13 +98,44 @@ def kalman_tau(measurements, tau, x_lim, C, Q, R, x0):
 
     return x_est, s_est
 
-def kalman_batch(ys, taus, mu_lims, C, Qs, R, x0s):
+def kalman_batch(ys, taus, mu_lims, C, Qs, Rs, x0s):
     y_hats, s_hats = [], []
-    for y, tau, mu_lim, Q, y0 in zip(ys, taus, mu_lims, Qs, x0s):
+    for y, tau, mu_lim, Q, R, y0 in zip(ys, taus, mu_lims, Qs, Rs, x0s):
         y_hat, s_hat = kalman_tau(y, tau, mu_lim, C, Q, R, y0)
         y_hats.append(y_hat)
         s_hats.append(s_hat)
     return np.stack([batch for batch in y_hats], axis=0), np.stack([batch for batch in s_hats], axis=0)
+
+
+def kalman_fit(ys, tau_init, b_init, true_sigma_q, true_sigma_r, n_iter):
+    # Instead of using already computed parameters, estimate parameters by EM
+    # Convert to A matrix format: x_t = x_t-1 + (b - x_t-1)/tau
+    A_init = np.array([[1.0 - 1.0/tau_init, b_init/tau_init], [0.0, 1.0]])
+
+    # Ground truth noise covariances (FIXED, not estimated)
+    Q_true = np.array([[true_sigma_q**2, 0.0], [0.0, 0.0]])  # Only first state has noise
+    R_true = np.array([[true_sigma_r**2]])  # 1D observation noise
+
+    kf = KalmanFilter(
+        transition_matrices=A_init,  # Start with random initial guess
+        observation_matrices=np.array([[1.0, 0.0]]),  # Fixed - observe only x, not intercept
+        transition_covariance=Q_true,  # Ground truth (FIXED)
+        observation_covariance=R_true,  # Ground truth (FIXED)
+        initial_state_mean=np.array([0.0, 1.0]),  # Second component should be 1
+        initial_state_covariance=np.array([[1.0, 0.0], [0.0, 0.01]]),  # Small variance on intercept
+        n_dim_state=2,
+        n_dim_obs=1  # 1D observations
+    )
+
+    # Fit parameters using EM algorithm - only estimate transition matrix and initial conditions
+    kf_fitted = kf.em(ys, n_iter=n_iter,
+                        em_vars=['transition_matrices', 'initial_state_mean', 'initial_state_covariance'])
+
+    pass
+
+
+def kalman_fit_batch():
+    pass
 
 
 
