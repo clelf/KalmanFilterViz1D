@@ -107,35 +107,37 @@ def kalman_batch(ys, taus, mu_lims, C, Qs, Rs, x0s):
     return np.stack([batch for batch in y_hats], axis=0), np.stack([batch for batch in s_hats], axis=0)
 
 
-def kalman_fit(ys, tau_init, b_init, true_sigma_q, true_sigma_r, n_iter):
+def kalman_fit(y, n_iter): # tau_init, b_init
+    """
+    Elapsed time (s): 1.15, n_iter: 5, n_samples: 1000
+    Elapsed time (s): 2.28, n_iter: 10, n_samples: 1000
+    """
     # Instead of using already computed parameters, estimate parameters by EM
     # Convert to A matrix format: x_t = x_t-1 + (b - x_t-1)/tau
-    A_init = np.array([[1.0 - 1.0/tau_init, b_init/tau_init], [0.0, 1.0]])
-
-    # Ground truth noise covariances (FIXED, not estimated)
-    Q_true = np.array([[true_sigma_q**2, 0.0], [0.0, 0.0]])  # Only first state has noise
-    R_true = np.array([[true_sigma_r**2]])  # 1D observation noise
+    # A_init = np.array([[1.0 - 1.0/tau_init, b_init/tau_init], [0.0, 1.0]])
 
     kf = KalmanFilter(
-        transition_matrices=A_init,  # Start with random initial guess
+        # transition_matrices=A_init,  # Start with random initial guess
         observation_matrices=np.array([[1.0, 0.0]]),  # Fixed - observe only x, not intercept
-        transition_covariance=Q_true,  # Ground truth (FIXED)
-        observation_covariance=R_true,  # Ground truth (FIXED)
-        initial_state_mean=np.array([0.0, 1.0]),  # Second component should be 1
-        initial_state_covariance=np.array([[1.0, 0.0], [0.0, 0.01]]),  # Small variance on intercept
         n_dim_state=2,
         n_dim_obs=1  # 1D observations
     )
 
     # Fit parameters using EM algorithm - only estimate transition matrix and initial conditions
-    kf_fitted = kf.em(ys, n_iter=n_iter,
-                        em_vars=['transition_matrices', 'initial_state_mean', 'initial_state_covariance'])
+    kf_fitted = kf.em(y, n_iter=n_iter, em_vars='all')
 
-    pass
+    # Kalman filtering
+    state_means_filt, state_covariances_filt = kf_fitted.filter(y)
+    return state_means_filt[:,0], state_covariances_filt[:,0,0], kf_fitted
 
 
-def kalman_fit_batch():
-    pass
+def kalman_fit_batch(ys, n_iter):
+    y_hats, s_hats = [], []
+    for y in ys:
+        y_hat, s_hat, _ = kalman_fit(y, n_iter)
+        y_hats.append(y_hat)
+        s_hats.append(s_hat)
+    return np.stack([batch for batch in y_hats], axis=0), np.stack([batch for batch in s_hats], axis=0)
 
 
 
