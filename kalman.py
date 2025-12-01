@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from pykalman import KalmanFilter
+from tqdm import tqdm
 
 
 def process_dynamics_A(A, B, Q, T, x0, s0):
@@ -133,7 +134,7 @@ def kalman_fit(y, n_iter): # tau_init, b_init
 
 def kalman_fit_batch(ys, n_iter):
     y_hats, s_hats = [], []
-    for y in ys:
+    for y in tqdm(ys, desc="Samples fit to KF by EM"):
         y_hat, s_hat, _ = kalman_fit(y, n_iter)
         y_hats.append(y_hat)
         s_hats.append(s_hat)
