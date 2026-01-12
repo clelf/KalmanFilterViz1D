@@ -4,6 +4,11 @@ from pykalman import KalmanFilter
 from tqdm import tqdm
 
 
+# Minimum observations needed for EM algorithm (n_dim_state + 1)
+# EM requires at least this many observations to estimate covariance matrices without division by zero
+MIN_OBS_FOR_EM = 3
+
+
 def process_dynamics_A(A, B, Q, T, x0, s0):
     # Generate the process's states with noise of var Q
     process_state = np.zeros(T)
@@ -136,58 +141,72 @@ def kalman_fit(y, n_iter): # tau_init, b_init
 
     # Kalman filtering - returns filtered state estimates
     # state_means_filt[t] is the state estimate after seeing y[0:t]
-    state_means_filt, state_covariances_filt = kf_fitted.filter(y)
+    state_means_filt, state_covariances_filt = kf_fitted.filter(y) # TODO: check dimensions
     
-    return state_means_filt[:,0], state_covariances_filt[:,0,0], kf_fitted
+    # return state_means_filt[:,0], state_covariances_filt[:,0,0], kf_fitted # "first component" = ?
+    return state_means_filt, state_covariances_filt, kf_fitted
 
 
 def kalman_fit_predict(y, n_iter):
     """
     Fit a Kalman filter using EM and return ONE-STEP-AHEAD predictions.
     
-    Wrapper around kalman_fit that computes predictions for the next timestep.
-    After seeing observations up to y[t], predict y[t+1].
+    Each prediction y_hat[t] is a one-step-ahead prediction for y[t+1],
+    based on a Kalman filter whose parameters are fit using EM on observations
+    y[0:t+1] (i.e., all observations up to and including y[t]).
+    
+    This ensures that prediction at time t+1 only uses information from times 0 to t
+    (no data leakage from future observations).
+    
+    Parameters:
+        y: 1D array of observations of length T
+        n_iter: Number of EM iterations for fitting
     
     Returns:
-        y_hat: One-step-ahead predictions. y_hat[t] is the prediction for y[t+1] given y[0:t].
-        s_hat: Corresponding prediction standard deviations.
-        kf_fitted: The fitted Kalman filter object.
+        y_hat: One-step-ahead predictions of length T-MIN_OBS_FOR_EM. 
+               y_hat[t] is the prediction for y[t+MIN_OBS_FOR_EM] given y[0:t+MIN_OBS_FOR_EM].
+        s_hat: Corresponding prediction standard deviations of length T-MIN_OBS_FOR_EM.
+        kf_fitted: The last fitted Kalman filter object (fit on full sequence).
+    
+    Note:
+        EM requires at least MIN_OBS_FOR_EM=3 observations (n_dim_state + 1) to estimate
+        covariance matrices without division by zero. Therefore, predictions start at
+        index MIN_OBS_FOR_EM-1, predicting y[MIN_OBS_FOR_EM:].
     """
-    # Get filtered estimates
-    state_means_filt, state_covariances_filt, kf_fitted = kalman_fit(y, n_iter)
-    
-    # Note: kalman_fit returns only the first component, we need full state for prediction
-    # Re-run filter to get full state (or modify kalman_fit to return full state)
-    full_state_means, full_state_covs = kf_fitted.filter(y)
-    
-    # Get fitted parameters for one-step-ahead prediction
-    A = kf_fitted.transition_matrices
-    H = kf_fitted.observation_matrices
-    Q = kf_fitted.transition_covariance
-    R = kf_fitted.observation_covariance
-    
-    # Handle None values
-    if A is None:
-        A = np.eye(2)
-    if Q is None:
-        Q = np.eye(2) * 0.1
-    if R is None:
-        R = np.array([[1.0]])
-    
+
     T = len(y)
-    y_hat = np.zeros(T)
-    s_hat = np.zeros(T)
+    y_hat = np.zeros(T - MIN_OBS_FOR_EM)
+    s_hat = np.zeros(T - MIN_OBS_FOR_EM)
+    kf_fitted = None
     
     # Compute one-step-ahead predictions
-    # After filtering at time t (using y[0:t]), predict y[t+1]
-    for t in range(T):
-        x_next_pred = A @ full_state_means[t]
-        P_next_pred = A @ full_state_covs[t] @ A.T + Q
+    # To predict y[t+1], we fit KF on y[0:t+1] and use the last filtered state
+    # Start at t = MIN_OBS_FOR_EM - 1 so we have at least MIN_OBS_FOR_EM observations
+    for t in tqdm(range(MIN_OBS_FOR_EM - 1, T - 1), desc="Fitting current sample's individual timesteps", leave=False):
+        # Output index offset by MIN_OBS_FOR_EM - 1
+        out_idx = t - (MIN_OBS_FOR_EM - 1)
+              
+        # Fit Kalman filter on observations y[0:t+1] (indices 0 to t inclusive)
+        state_means_filt, state_covariances_filt, kf_fitted = kalman_fit(y[:t + 1], n_iter)
         
-        y_hat[t] = (H @ x_next_pred)[0]
-        s_hat[t] = (H @ P_next_pred @ H.T + R)[0, 0]
+        # Get fitted parameters for one-step-ahead prediction (with defaults for None)
+        A, Q, H, R = _get_kf_params(kf_fitted)
+        
+        # Use the LAST filtered state (index -1, which corresponds to time t)
+        # to predict y[t+1]
+        x_last = state_means_filt[-1]  # Last filtered state mean
+        P_last = state_covariances_filt[-1]  # Last filtered state covariance
+        
+        # One-step-ahead prediction: x_{t+1|t} = A @ x_{t|t}
+        x_next_pred = A @ x_last
+        P_next_pred = A @ P_last @ A.T + Q
+        
+        # Observation prediction: y_{t+1|t} = H @ x_{t+1|t}
+        y_hat[out_idx] = (H @ x_next_pred)[0]
+        s_hat[out_idx] = np.sqrt((H @ P_next_pred @ H.T + R)[0, 0])
     
-    return y_hat, np.sqrt(s_hat), kf_fitted
+    return y_hat, s_hat, kf_fitted
+
 
 
 def kalman_fit_batch(ys, n_iter, predict=False):
@@ -202,14 +221,16 @@ def kalman_fit_batch(ys, n_iter, predict=False):
         Number of EM iterations
     predict : bool
         If False, return filtered estimates (y_hat[t] is estimate after seeing y[0:t])
+                  Output shape: (N_samples, T)
         If True, return one-step-ahead predictions (y_hat[t] predicts y[t+1])
+                  Output shape: (N_samples, T-1)
     
     Returns
     -------
     y_hats : np.array
-        Shape (N_samples, T)
+        Shape (N_samples, T) if predict=False, (N_samples, T-1) if predict=True
     s_hats : np.array
-        Shape (N_samples, T) of standard deviations
+        Shape (N_samples, T) if predict=False, (N_samples, T-1) if predict=True (standard deviations)
     """
     fit_func = kalman_fit_predict if predict else kalman_fit
     desc = "Samples fit to KF by EM" + (" (predict)" if predict else "")
@@ -253,7 +274,7 @@ def _fit_context_kfs(y, contexts, n_ctx, n_iter):
         ctx_mask = (contexts == c)
         y_ctx = y[ctx_mask]
         
-        if len(y_ctx) > 2:  # Need enough observations to fit
+        if len(y_ctx) >= MIN_OBS_FOR_EM:  # Need enough observations for EM
             kf = KalmanFilter(
                 observation_matrices=np.array([[1.0, 0.0]]),
                 n_dim_state=2,
@@ -275,9 +296,9 @@ def _fit_context_kfs(y, contexts, n_ctx, n_iter):
 
 def _get_kf_params(kf):
     """Helper to get KF parameters with defaults for None values."""
-    A = kf.transition_matrices if kf.transition_matrices is not None else np.eye(2)
+    A = kf.transition_matrices if kf.transition_matrices is not None else np.array([[0.99, 0.01], [0.0, 1.0]])
     Q = kf.transition_covariance if kf.transition_covariance is not None else np.eye(2) * 0.1
-    H = kf.observation_matrices
+    H = kf.observation_matrices if kf.observation_matrices is not None else np.array([[1.0, 0.0]])
     R = kf.observation_covariance if kf.observation_covariance is not None else np.array([[1.0]])
     return A, Q, H, R
 
@@ -354,11 +375,16 @@ def kalman_fit_context_aware(y, contexts, n_iter):
     return y_hat, np.sqrt(s_hat), kfs
 
 
-def kalman_fit_context_aware_predict(y, contexts, n_iter):
+def kalman_fit_context_aware_predict(y, contexts, n_iter, min_obs_per_ctx=5, refit_interval=10):
     """
     Context-aware Kalman filter that returns ONE-STEP-AHEAD predictions.
     
-    After seeing observations up to y[t], predict y[t+1].
+    Each prediction y_hat[t] is a one-step-ahead prediction for y[t+1],
+    based on Kalman filters whose parameters are fit using EM on observations
+    y[0:t+1] (i.e., all observations up to and including y[t]).
+    
+    This ensures that prediction at time t+1 only uses information from times 0 to t
+    (no data leakage from future observations).
     
     Parameters
     ----------
@@ -372,43 +398,69 @@ def kalman_fit_context_aware_predict(y, contexts, n_iter):
     Returns
     -------
     y_hat : np.array
-        One-step-ahead predictions of length T. y_hat[t] predicts y[t+1] given y[0:t].
+        One-step-ahead predictions of length T-1. y_hat[t] predicts y[t+1] given y[0:t].
     s_hat : np.array
-        Corresponding prediction standard deviations of length T
+        Corresponding prediction standard deviations of length T-1
     kfs : list
-        List of fitted KalmanFilter objects, one per context
+        List of fitted KalmanFilter objects, one per context (fit on full sequence)
     """
     T = len(y)
     n_ctx = len(np.unique(contexts))
     
-    # Fit KFs per context (reuse the fitting logic)
-    kfs = _fit_context_kfs(y, contexts, n_ctx, n_iter)
+    y_hat = np.zeros(T - 1)
+    s_hat = np.zeros(T - 1)
     
-    # Run context-aware filter with one-step-ahead predictions
-    y_hat = np.zeros(T)
-    s_hat = np.zeros(T)
-    
+    # State means and covariances for each context
     state_means = [np.zeros(2) for _ in range(n_ctx)]
     state_covs = [np.eye(2) * 1.0 for _ in range(n_ctx)]
     
-    for c in range(n_ctx):
-        if hasattr(kfs[c], 'initial_state_mean') and kfs[c].initial_state_mean is not None:
-            state_means[c] = kfs[c].initial_state_mean.copy()
-        if hasattr(kfs[c], 'initial_state_covariance') and kfs[c].initial_state_covariance is not None:
-            state_covs[c] = kfs[c].initial_state_covariance.copy()
+    # Current fitted KF parameters for each context (start with defaults)
+    kfs = [None] * n_ctx
+    A_default = np.array([[0.99, 0.01], [0.0, 1.0]])
+    Q_default = np.eye(2) * 0.1
+    H_default = np.array([[1.0, 0.0]])
+    R_default = np.array([[1.0]])
     
-    for t in range(T):
+    # Track observation counts per context
+    obs_counts = [0] * n_ctx
+    # Track cumulative observations per context for mean fallback
+    obs_sums = [0.0] * n_ctx
+    
+    # Store when we last refit each context
+    last_refit = [0] * n_ctx
+    
+    for t in range(T - 1):
+        # Update observation counts for current context
+        c_current = contexts[t]
+        obs_counts[c_current] += 1
+        obs_sums[c_current] += y[t]
+        
+        # Fit KFs on observations y[0:t+1] using contexts[0:t+1]
+        kfs = _fit_context_kfs(y[:t + 1], contexts[:t + 1], n_ctx, n_iter)
+        for c in range(n_ctx):
+            last_refit[c] = t
+            # Re-initialize states with fitted initial conditions
+            if kfs[c] is not None:
+                if hasattr(kfs[c], 'initial_state_mean') and kfs[c].initial_state_mean is not None:
+                    state_means[c] = kfs[c].initial_state_mean.copy()
+                if hasattr(kfs[c], 'initial_state_covariance') and kfs[c].initial_state_covariance is not None:
+                    state_covs[c] = kfs[c].initial_state_covariance.copy()
+        
+        # Get current context
         c = contexts[t]
         kf = kfs[c]
         
-        # Get KF parameters with defaults
-        A, Q, H, R = _get_kf_params(kf)
+        # Get KF parameters (use defaults if not yet fitted)
+        if kf is not None:
+            A, Q, H, R = _get_kf_params(kf)
+        else:
+            A, Q, H, R = A_default, Q_default, H_default, R_default
         
-        # Prediction step
+        # Kalman filter predict step (prior)
         x_pred = A @ state_means[c]
         P_pred = A @ state_covs[c] @ A.T + Q
         
-        # Update step with current observation y[t]
+        # Kalman filter update step with observation y[t]
         y_obs = np.array([[y[t]]])
         innovation = y_obs - H @ x_pred.reshape(-1, 1)
         S = H @ P_pred @ H.T + R
@@ -418,13 +470,26 @@ def kalman_fit_context_aware_predict(y, contexts, n_iter):
         state_covs[c] = (np.eye(2) - K @ H) @ P_pred
         
         # ONE-STEP-AHEAD PREDICTION: After updating with y[t], predict y[t+1]
-        x_next_pred = A @ state_means[c]
-        P_next_pred = A @ state_covs[c] @ A.T + Q
+        # We use the NEXT context (contexts[t+1]) for the prediction
+        c_next = contexts[t + 1] if t + 1 < T else c
+        kf_next = kfs[c_next]
         
-        y_hat[t] = (H @ x_next_pred)[0]
-        s_hat[t] = (H @ P_next_pred @ H.T + R)[0, 0]
+        if kf_next is not None:
+            A_next, Q_next, H_next, R_next = _get_kf_params(kf_next)
+        else:
+            A_next, Q_next, H_next, R_next = A_default, Q_default, H_default, R_default
+        
+        # Predict next state and observation
+        x_next_pred = A_next @ state_means[c_next]
+        P_next_pred = A_next @ state_covs[c_next] @ A_next.T + Q_next
+        
+        y_hat[t] = (H_next @ x_next_pred)[0]
+        s_hat[t] = np.sqrt((H_next @ P_next_pred @ H_next.T + R_next)[0, 0])
     
-    return y_hat, np.sqrt(s_hat), kfs
+    # Final fit on full data (for returning)
+    kfs = _fit_context_kfs(y, contexts, n_ctx, n_iter)
+    
+    return y_hat, s_hat, kfs
 
 
 def kalman_fit_context_aware_batch(ys, contexts_batch, n_iter, predict=False):
@@ -441,14 +506,16 @@ def kalman_fit_context_aware_batch(ys, contexts_batch, n_iter, predict=False):
         Number of EM iterations
     predict : bool
         If False, return filtered estimates (y_hat[t] is estimate after seeing y[0:t])
+                  Output shape: (N_samples, T)
         If True, return one-step-ahead predictions (y_hat[t] predicts y[t+1])
+                  Output shape: (N_samples, T-1)
     
     Returns
     -------
     y_hats : np.array
-        Shape (N_samples, T)
+        Shape (N_samples, T) if predict=False, (N_samples, T-1) if predict=True
     s_hats : np.array
-        Shape (N_samples, T) of standard deviations
+        Shape (N_samples, T) if predict=False, (N_samples, T-1) if predict=True (standard deviations)
     """
     fit_func = kalman_fit_context_aware_predict if predict else kalman_fit_context_aware
     desc = "Context-aware KF by EM" + (" (predict)" if predict else "")
