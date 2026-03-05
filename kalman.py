@@ -447,9 +447,12 @@ def kalman_fit_predict_multicontext(y, responsibilities, n_iter):
         # Only store predictions for t+1 >= MIN_OBS_FOR_EM (i.e., t >= MIN_OBS_FOR_EM - 1)
         if t >= MIN_OBS_FOR_EM - 1:
             out_idx = t - (MIN_OBS_FOR_EM - 1)
-            
-            # Aggregate using responsibilities at t+1
-            lambda_next = responsibilities[t + 1, :]
+
+            # Aggregate using context belief at time t (the last observed timestep).
+            # Using responsibilities[t+1] would be an oracle leak: it would use the
+            # true ground-truth context at the *future* timestep we are predicting.
+            # responsibilities[t] is causally correct: it reflects what we know at t.
+            lambda_next = responsibilities[t, :]
             
             y_hat[out_idx] = np.sum(lambda_next * per_ctx_pred_means)
             within_var = per_ctx_pred_vars
@@ -504,19 +507,32 @@ def kalman_fit_predict_multicontext_batch(ys, responsibilities_batch, n_iter):
 
 def _fit_context_kfs(y, contexts, n_ctx, n_iter):
     """
-    Helper function to fit separate Kalman filters for each context.
-    
+    Fit separate Kalman filters for each context using masked arrays.
+
+    For each context c, the full-length observation sequence is passed to
+    pykalman with all timesteps where ``contexts != c`` masked out.  pykalman
+    runs the prediction step (advancing the state via A and Q) at *every*
+    timestep but only performs a measurement update at unmasked ones.
+
+    This is the correct way to handle the temporal gaps between same-context
+    blocks: the latent process is assumed to have continued evolving during
+    the gap, we simply did not observe it.  Consequently EM estimates Q as a
+    genuine 1-step transition covariance rather than an inflated mixture of
+    multi-step variances (which would happen if non-contiguous observations
+    were concatenated and presented as consecutive).
+
     Parameters
     ----------
     y : np.array
-        1D array of observations
+        1D array of observations of length T
     contexts : np.array
-        1D integer array indicating context at each timestep
+        1D integer array of shape (T,) indicating the active context at each
+        timestep (values in [0, n_ctx-1])
     n_ctx : int
         Number of distinct contexts
     n_iter : int
-        Number of EM iterations
-    
+        Number of EM iterations for each Kalman filter
+
     Returns
     -------
     kfs : list
@@ -524,24 +540,28 @@ def _fit_context_kfs(y, contexts, n_ctx, n_iter):
     """
     kfs = []
     for c in range(n_ctx):
-        ctx_mask = (contexts == c)
-        y_ctx = y[ctx_mask]
-        
-        if len(y_ctx) >= MIN_OBS_FOR_EM:  # Need enough observations for EM
+        # Mask every timestep where context c is NOT active.
+        # pykalman skips the observation update at masked steps but still
+        # advances the state, so Q is estimated and applied at the correct
+        # 1-step timescale across gaps.
+        y_masked = np.ma.array(y, mask=(contexts != c))
+
+        n_active = int((contexts == c).sum())
+        if n_active >= MIN_OBS_FOR_EM:
             kf = KalmanFilter(
                 observation_matrices=np.array([[1.0, 0.0]]),
                 n_dim_state=2,
-                n_dim_obs=1
+                n_dim_obs=1,
             )
-            kf_fitted = kf.em(y_ctx, n_iter=n_iter, em_vars='all')
+            kf_fitted = kf.em(y_masked, n_iter=n_iter, em_vars='all')
             kfs.append(kf_fitted)
         else:
-            # Fallback: use default parameters if too few observations
+            # Fallback: use default parameters if too few active observations
             kf = KalmanFilter(
                 transition_matrices=np.array([[0.9, 0.1], [0.0, 1.0]]),
                 observation_matrices=np.array([[1.0, 0.0]]),
                 n_dim_state=2,
-                n_dim_obs=1
+                n_dim_obs=1,
             )
             kfs.append(kf)
     return kfs
