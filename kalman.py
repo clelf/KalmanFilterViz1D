@@ -315,11 +315,14 @@ def kalman_fit_multicontext(y, responsibilities, n_iter):
             mu_pred = A @ mu
             Sigma_pred = A @ Sigma @ A.T + Q
             
-            # Update with observation
+            # Responsibility-gated update: scale the Kalman gain by λ[t,c].
+            # This matches the masked-array EM fitting where KF c only received
+            # observation updates when context c was dominant.
+            lam = responsibilities[t, c]
             y_obs = np.array([[y[t]]])
             innovation = y_obs - H @ mu_pred.reshape(-1, 1)
             S = H @ Sigma_pred @ H.T + R
-            K = Sigma_pred @ H.T @ np.linalg.inv(S)
+            K = lam * (Sigma_pred @ H.T @ np.linalg.inv(S))
             
             mu = (mu_pred.reshape(-1, 1) + K @ innovation).flatten()
             Sigma = (np.eye(2) - K @ H) @ Sigma_pred
@@ -416,7 +419,11 @@ def kalman_fit_predict_multicontext(y, responsibilities, n_iter):
     
     # Process all timesteps, but only store predictions starting from MIN_OBS_FOR_EM
     for t in range(T - 1):
-        # Update all contexts with current observation y[t]
+        # Update each context KF weighted by its responsibility at time t.
+        # This matches how each KF was *fitted*: _fit_context_kfs uses masked arrays so
+        # KF c only received observation updates at timesteps where context c was active.
+        # Using full updates for all KFs here (regardless of context) would contaminate
+        # "sleeping" KFs with wrong-context observations, biasing their state estimates.
         per_ctx_pred_means = np.zeros(n_ctx)
         per_ctx_pred_vars = np.zeros(n_ctx)
         
@@ -424,15 +431,19 @@ def kalman_fit_predict_multicontext(y, responsibilities, n_iter):
             kf = kfs[c]
             A, Q, H, R = _get_kf_params(kf)
             
-            # Predict
+            # Predict (always propagate the state forward)
             mu_pred = A @ mus[c]
             Sigma_pred = A @ Sigmas[c] @ A.T + Q
             
-            # Update with y[t]
+            # Responsibility-gated update: scale the Kalman gain by λ[t,c].
+            # When λ=1 (this context is fully active) → standard Kalman update.
+            # When λ=0 (this context is inactive)    → only predict step, no update.
+            # This keeps the inference consistent with the masked-array EM fitting.
+            lam = responsibilities[t, c]
             y_obs = np.array([[y[t]]])
             innovation = y_obs - H @ mu_pred.reshape(-1, 1)
             S = H @ Sigma_pred @ H.T + R
-            K = Sigma_pred @ H.T @ np.linalg.inv(S)
+            K = lam * (Sigma_pred @ H.T @ np.linalg.inv(S))
             
             mus[c] = (mu_pred.reshape(-1, 1) + K @ innovation).flatten()
             Sigmas[c] = (np.eye(2) - K @ H) @ Sigma_pred
