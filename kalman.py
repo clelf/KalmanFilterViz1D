@@ -105,66 +105,6 @@ def kalman_tau(measurements, tau, x_lim, C, Q, R, x0):
 
     return x_est, s_est
 
-def _fit_context_kfs(y, contexts, n_ctx, n_iter):
-    """
-    Fit separate Kalman filters for each context using masked arrays.
-
-    For each context c, the full-length observation sequence is passed to
-    pykalman with all timesteps where ``contexts != c`` masked out.  pykalman
-    runs the prediction step (advancing the state via A and Q) at *every*
-    timestep but only performs a measurement update at unmasked ones.
-
-    This is the correct way to handle the temporal gaps between same-context
-    blocks: the latent process is assumed to have continued evolving during
-    the gap, we simply did not observe it.  Consequently EM estimates Q as a
-    genuine 1-step transition covariance rather than an inflated mixture of
-    multi-step variances (which would happen if non-contiguous observations
-    were concatenated and presented as consecutive).
-
-    Parameters
-    ----------
-    y : np.array
-        1D array of observations of length T
-    contexts : np.array
-        1D integer array of shape (T,) indicating the active context at each
-        timestep (values in [0, n_ctx-1])
-    n_ctx : int
-        Number of distinct contexts
-    n_iter : int
-        Number of EM iterations for each Kalman filter
-
-    Returns
-    -------
-    kfs : list
-        List of fitted KalmanFilter objects, one per context
-    """
-    kfs = []
-    for c in range(n_ctx):
-        # Mask every timestep where context c is NOT active.
-        # pykalman skips the observation update at masked steps but still
-        # advances the state, so Q is estimated and applied at the correct
-        # 1-step timescale across gaps.
-        y_masked = np.ma.array(y, mask=(contexts != c))
-
-        n_active = int((contexts == c).sum())
-        if n_active >= MIN_OBS_FOR_EM:
-            kf = KalmanFilter(
-                observation_matrices=np.array([[1.0, 0.0]]),
-                n_dim_state=2,
-                n_dim_obs=1,
-            )
-            kf_fitted = kf.em(y_masked, n_iter=n_iter, em_vars='all')
-            kfs.append(kf_fitted)
-        else:
-            # Fallback: use default parameters if too few active observations
-            kf = KalmanFilter(
-                transition_matrices=np.array([[0.9, 0.1], [0.0, 1.0]]),
-                observation_matrices=np.array([[1.0, 0.0]]),
-                n_dim_state=2,
-                n_dim_obs=1,
-            )
-            kfs.append(kf)
-    return kfs
 
 
 def _get_kf_params(kf):
@@ -174,62 +114,6 @@ def _get_kf_params(kf):
     H = kf.observation_matrices if kf.observation_matrices is not None else np.array([[1.0, 0.0]])
     R = kf.observation_covariance if kf.observation_covariance is not None else np.array([[1.0]])
     return A, Q, H, R
-
-
-def _kalman_step(mu, Sigma, y_t, A, Q, H, R, lam=1.0):
-    """Single Kalman predict + responsibility-gated update step.
-
-    Implements Eqs. 9–10 of the derivation document: the update collapses the
-    two-component Gaussian mixture (updated / not-updated) into a single Gaussian
-    by matching the mixture mean and variance.
-
-    Parameters
-    ----------
-    mu : np.array, shape (n,)
-        Current state mean.
-    Sigma : np.array, shape (n, n)
-        Current state covariance.
-    y_t : float
-        Current scalar observation.
-    A, Q, H, R : KF parameter matrices.
-    lam : float
-        Responsibility weight in [0, 1]. lam=1 gives a standard Kalman update;
-        lam=0 gives a prediction-only step (no measurement update).
-
-    Returns
-    -------
-    mu_new : np.array, shape (n,) — updated state mean.
-    Sigma_new : np.array, shape (n, n) — updated state covariance.
-    mu_pred : np.array, shape (n,) — predicted mean (before measurement update).
-    Sigma_pred : np.array, shape (n, n) — predicted covariance (before update).
-
-    Notes
-    -----
-    Mean update  (Eq. 9):  mu_new  = mu_pred + lam * K * eps
-    Covar update (Eq. 10): Sigma_new = (I - lam*K*H) @ Sigma_pred          <- within-component
-                                      + lam*(1-lam) * (K*eps) @ (K*eps)^T  <- between-component
-    The between-component term is the extra contribution that arises from
-    collapsing the two-Gaussian mixture into a single Gaussian and is missing
-    from a naive "scaled-gain" Kalman update.
-    """
-    mu_pred = A @ mu
-    Sigma_pred = A @ Sigma @ A.T + Q
-
-    y_obs = np.array([[y_t]])
-    innovation = y_obs - H @ mu_pred.reshape(-1, 1)   # ε = y - H * mu_pred, shape (m, 1)
-    S = H @ Sigma_pred @ H.T + R
-    K_std = Sigma_pred @ H.T @ np.linalg.inv(S)       # Standard (unscaled) Kalman gain, shape (n, m)
-
-    K_eps = K_std @ innovation                         # K * ε, shape (n, 1)
-
-    # Eq. 9: mean update scaled by responsibility
-    mu_new = (mu_pred.reshape(-1, 1) + lam * K_eps).flatten()
-
-    # Eq. 10: within-component variance + between-component variance
-    Sigma_new = (np.eye(len(mu)) - lam * K_std @ H) @ Sigma_pred \
-                + lam * (1.0 - lam) * K_eps @ K_eps.T
-
-    return mu_new, Sigma_new, mu_pred, Sigma_pred
 
 
 def _init_context_states(kfs):
@@ -256,7 +140,7 @@ def _aggregate_contexts(per_ctx_means, per_ctx_vars, lambda_t):
     ----------
     per_ctx_means : np.array, shape (C,)
     per_ctx_vars  : np.array, shape (C,)  — per-context variances (not stds)
-    lambda_t      : np.array, shape (C,)  — responsibility weights (sum to 1)
+    lambda_t      : np.array, shape (C,)  — context probabilities weights (sum to 1)
 
     Returns
     -------
@@ -271,17 +155,17 @@ def _aggregate_contexts(per_ctx_means, per_ctx_vars, lambda_t):
 
 
 
-def _compute_marginal_context_responsibilities(per_rule_responsibilities, rule_responsibilities):
-    """Marginalise context responsibilities over rules.
+def _compute_marginal_context_probabilities(per_rule_probabilities, rule_probabilities):
+    """Marginalise context probabilities over rules.
 
     Parameters
     ----------
-    per_rule_responsibilities : np.array, shape [R, T, C]
+    per_rule_probabilities : np.array, shape [R, T, C]
         Context responsibilities conditioned on each rule:
-        per_rule_responsibilities[r, t, c] = P(context=c | rule=r, t).
+        per_rule_probabilities[r, t, c] = P(context=c | rule=r, t).
         For each (r, t), the values along the C axis should sum to 1.
-    rule_responsibilities : np.array, shape [T, R]
-        Rule probabilities: rule_responsibilities[t, r] = P(rule=r | t).
+    rule_probabilities : np.array, shape [T, R]
+        Rule probabilities: rule_probabilities[t, r] = P(rule=r | t).
         For each t, values along the R axis should sum to 1.
 
     Returns
@@ -290,12 +174,12 @@ def _compute_marginal_context_responsibilities(per_rule_responsibilities, rule_r
         Marginalized context probabilities:
         marg_resp[t, c] = sum_r  P(rule=r | t) * P(context=c | rule=r, t).
     """
-    # rule_responsibilities : [T, R]
-    # per_rule_responsibilities : [R, T, C]
+    # rule_probabilities : [T, R]
+    # per_rule_probabilities : [R, T, C]
     # result : [T, C]
-    marg_resp = np.einsum('tr,rtc->tc', rule_responsibilities, per_rule_responsibilities)
+    marg_resp = np.einsum('tr,rtc->tc', rule_probabilities, per_rule_probabilities)
     # Alternative:
-    # marg_resp = np.array([rule_responsibilities[t] @ per_rule_responsibilities[:, t, :] for t in range(T)])
+    # marg_resp = np.array([rule_probabilities[t] @ per_rule_probabilities[:, t, :] for t in range(T)])
     return marg_resp
 
 
@@ -314,23 +198,26 @@ def plot_estim(obs, est_mu, est_var, process=None):
     plt.legend()
     plt.show()
 
-    
 
+def kalman_step(y_t, kf, state_mean_prev, state_cov_prev):
+    """Run a single Kalman step (predict + update) for one observation y_t, given the previous state mean and covariance.
+    Returns updated state mean and covariance after processing y_t.
+    Note: using pykalman's filter_update, works for 1 context; use _kalman_step_custom to control the update step with lambda if more than 1 context.
+    """
+    state_mean_new, state_cov_new = kf.filter_update(state_mean_prev, state_cov_prev, y_t)
+    return state_mean_new, state_cov_new
 
 
 def kalman_fit(y, n_iter): # tau_init, b_init
     """
-    Fit a Kalman filter using EM and return FILTERED state estimates.
+    Fit a Kalman filter using EM.
     
     Returns:
-        y_hat: Filtered estimates. y_hat[t] is the state estimate after seeing y[0:t].
-        s_hat: Corresponding state variances (not std).
         kf_fitted: The fitted Kalman filter object.
     
     Elapsed time (s): 1.15, n_iter: 5, n_samples: 1000
     Elapsed time (s): 2.28, n_iter: 10, n_samples: 1000
     """
-    # Instead of using already computed parameters, estimate parameters by EM
     # Convert to A matrix format: x_t = x_t-1 + (b - x_t-1)/tau
     # A_init = np.array([[1.0 - 1.0/tau_init, b_init/tau_init], [0.0, 1.0]])
 
@@ -344,16 +231,40 @@ def kalman_fit(y, n_iter): # tau_init, b_init
     # Fit parameters using EM algorithm - only estimate transition matrix and initial conditions
     kf_fitted = kf.em(y, n_iter=n_iter, em_vars='all')
 
-    # Kalman filtering - returns filtered state estimates
-    # state_means_filt[t] is the state estimate after seeing y[0:t]
-    state_means_filt, state_covariances_filt = kf_fitted.filter(y) # TODO: check dimensions
+    return kf_fitted
+
+
+def kalman_filtering(y, kf):
+    """Filter a sequence of observations using a Kalman filter object already instantiated.
     
-    # return state_means_filt[:,0], state_covariances_filt[:,0,0], kf_fitted # "first component" = ?
+    state_means_filt[t] is the state estimate after seeing y[0:t]
+    """
+    state_means_filt, state_covariances_filt = kf.filter(y) # TODO: check dimensions
+    
+    return state_means_filt, state_covariances_filt
+
+
+def kalman_fit_filter(y, n_iter): # tau_init, b_init
+    """
+    Fit a Kalman filter using EM AND return filtered state estimates associated with each observation of the sequence.
+    
+    Returns:
+        state_means_filt: Filtered state mean estimates. y_hat[t] is the state estimate after seeing y[0:t].
+        state_covariances_filt: Corresponding state covariance estimate.
+        kf_fitted: The fitted Kalman filter object.
+    
+    Elapsed time (s): 1.15, n_iter: 5, n_samples: 1000
+    Elapsed time (s): 2.28, n_iter: 10, n_samples: 1000
+    """
+
+    kf_fitted = kalman_fit(y, n_iter)
+    state_means_filt, state_covariances_filt = kalman_filtering(y, kf_fitted)
+
     return state_means_filt, state_covariances_filt, kf_fitted
 
 
 
-def kalman_fit_predict(y, n_iter):
+def kalman_online_fit_predict(y, n_iter):
     """
     Fit a Kalman filter using EM and return ONE-STEP-AHEAD predictions.
     
@@ -369,10 +280,14 @@ def kalman_fit_predict(y, n_iter):
         n_iter: Number of EM iterations for fitting
     
     Returns:
-        y_hat: One-step-ahead predictions of length T-MIN_OBS_FOR_EM. 
-               y_hat[t] is the prediction for y[t+MIN_OBS_FOR_EM] given y[0:t+MIN_OBS_FOR_EM].
-        s_hat: Corresponding prediction standard deviations of length T-MIN_OBS_FOR_EM.
-        kf_fitted: The last fitted Kalman filter object (fit on full sequence).
+        y_hat: 
+            One-step-ahead predictions of length T (previously: length T-MIN_OBS_FOR_EM).
+            y_hat[t] is the prediction for y[t] given y[0:t]. 
+            (previously: y_hat[t] is the prediction for y[t+MIN_OBS_FOR_EM] given y[0:t+MIN_OBS_FOR_EM].)
+        s_hat: 
+            Corresponding prediction standard deviations of length T (previously: length T-MIN_OBS_FOR_EM).
+        kf_fitted: 
+            The last fitted Kalman filter object (fit on full sequence).
     
     Note:
         EM requires at least MIN_OBS_FOR_EM=3 observations (n_dim_state + 1) to estimate
@@ -381,112 +296,256 @@ def kalman_fit_predict(y, n_iter):
     """
 
     T = len(y)
-    y_hat = np.zeros(T - MIN_OBS_FOR_EM)
-    s_hat = np.zeros(T - MIN_OBS_FOR_EM)
+    # y_hat = np.zeros(T - MIN_OBS_FOR_EM)
+    # s_hat = np.zeros(T - MIN_OBS_FOR_EM)
+    y_hat = np.ones(T) * np.nan
+    s_hat = np.ones(T) * np.nan
     kf_fitted = None
+    A, Q, H, R = None, None, None, None
     
     # Compute one-step-ahead predictions
     # To predict y[t+1], we fit KF on y[0:t+1] and use the last filtered state
     # Start at t = MIN_OBS_FOR_EM - 1 so we have at least MIN_OBS_FOR_EM observations
-    for t in tqdm(range(MIN_OBS_FOR_EM - 1, T - 1), desc="Fitting current sample's individual timesteps", leave=False):
-        # Output index offset by MIN_OBS_FOR_EM - 1
-        out_idx = t - (MIN_OBS_FOR_EM - 1)
-              
-        # Fit Kalman filter on observations y[0:t+1] (indices 0 to t inclusive)
-        state_means_filt, state_covariances_filt, kf_fitted = kalman_fit(y[:t + 1], n_iter)
+    for t in tqdm(range(MIN_OBS_FOR_EM - 1, T - 1), desc="Fitting current sample's individual timesteps", leave=False): # Last t == T-2 --> predict t == y[T-1] = y[-1]
+
+        # # Output index offset by MIN_OBS_FOR_EM - 1
+        # out_idx = t - (MIN_OBS_FOR_EM - 1)
+
+        # If current obs is masked, skip EM and reuse last fitted parameters to run the filter (besides, this will only propagate the prediction step)
+        # If not, update the KF with EM
+        if not np.ma.is_masked(y[t]) or kf_fitted is None: # kf_fitted will not be None if the first masked observation happens after at least MIN_OBS_EM
+            # Update KF parameters by fitting with EM based on observations y[0:t+1] (indices 0 to t inclusive) and filter
+            kf_fitted = kalman_fit(y[:t + 1], n_iter)
         
         # Get fitted parameters for one-step-ahead prediction (with defaults for None)
         A, Q, H, R = _get_kf_params(kf_fitted)
+
+        # Filter the sequence up to time t to get the last filtered state (index -1, which corresponds to time t)
+        # state_means_filt, state_covariances_filt = kf_fitted.filter(y[:t + 1]) # TODO: should use .filter_update maybe here since only producing one filter step?
+        state_means_filt, state_covariances_filt = kalman_filtering(y[:t + 1], kf_fitted) # TODO: should use .filter_update maybe here since only producing one filter step?
+
+        # Alternative:
+        # state_means_filt, state_covariances_filt = kf_fitted.filter_update(state_means_filt, state_covariances_filt, y[:t + 1]) # But need to initialize state_means_filt and state_covariances_filt first, which needs to take into account the fact that the first few observations might be masked
         
-        # Use the LAST filtered state (index -1, which corresponds to time t)
-        # to predict y[t+1]
+        # Use the LAST filtered state (index -1, which corresponds to time t) to predict y[t+1]
         x_last = state_means_filt[-1]  # Last filtered state mean
         P_last = state_covariances_filt[-1]  # Last filtered state covariance
         
-        # One-step-ahead prediction: x_{t+1|t} = A @ x_{t|t}
+        ### One-step-ahead prediction for y[t+1] using the KF equations + last fitted parameters:
+        # One-step-ahead state prediction: x_{t+1|t} = A @ x_{t|t}
+        # (see pykalman.standard filter_predict and filter_correct for verification)
         x_next_pred = A @ x_last
         P_next_pred = A @ P_last @ A.T + Q
         
-        # Observation prediction: y_{t+1|t} = H @ x_{t+1|t}
-        y_hat[out_idx] = (H @ x_next_pred)[0]
-        s_hat[out_idx] = np.sqrt((H @ P_next_pred @ H.T + R)[0, 0])
-    
-    return y_hat, s_hat, kf_fitted
+        # One-step-ahead observation prediction: y_{t+1|t} = H @ x_{t+1|t}
+        # y_hat[out_idx] = (H @ x_next_pred)[0]
+        # s_hat[out_idx] = np.sqrt((H @ P_next_pred @ H.T + R)[0, 0])
+        y_hat[t+1] = (H @ x_next_pred)[0]
+        s_hat[t+1] = np.sqrt((H @ P_next_pred @ H.T + R)[0, 0])
+    return y_hat, s_hat
 
 
-def kalman_fit_multicontext(y, responsibilities, n_iter):
+def kalman_step_multicontext(mu, Sigma, y_t, A, Q, H, R, lam=1.0):
+    """Single Kalman predict + prior context probability-weighted update step.
+
+    Implements Eqs. 9–10 of the derivation document: the update collapses the
+    two-component Gaussian mixture (updated / not-updated) into a single Gaussian
+    by matching the mixture mean and variance.
+
+    Note: n is the dimension of observations (=1 for 1D observations)
+
+    Note: this aligns with how 
+
+    Parameters
+    ----------
+    mu : np.array, shape (n,)
+        Mean of state at time t given observations from times [0...t]
+    Sigma : np.array, shape (n, n)
+        Covariance of state at time t given observations from times
+        [0...t]
+    y_t : float
+        Observation at time t.  If `observation` is a masked array and any of
+        its values are masked, the observation will be ignored (the prediction step is still performed, but not the update step which uses the observation).
+    A, Q, H, R : KF parameter matrices.
+    lam : float
+        Context probability weight in [0, 1]. lam=1 gives a standard Kalman update;
+        lam=0 gives a prediction-only step (no measurement update).
+
+    Returns
+    -------
+    mu_new : np.array, shape (n,) — updated state mean.
+    Sigma_new : np.array, shape (n, n) — updated state covariance.
+
+    Notes
+    -----
+    Mean update  (Eq. 9):  mu_new  = mu_pred + lam * K * eps
+    Covar update (Eq. 10): Sigma_new = (I - lam*K*H) @ Sigma_pred          <- within-component
+                                      + lam*(1-lam) * (K*eps) @ (K*eps)^T  <- between-component
+    The between-component term is the extra contribution that arises from
+    collapsing the two-Gaussian mixture into a single Gaussian and is missing
+    from a naive "scaled-gain" Kalman update.
     """
-    Multi-context Kalman filter with soft context assignments (responsibilities).
+    # Prediction step
+    mu_pred = A @ mu
+    Sigma_pred = A @ Sigma @ A.T + Q
+
+    # Update step
+    if not np.ma.is_masked(y_t):
+        y_obs = np.array([[y_t]])
+        innovation = y_obs - H @ mu_pred.reshape(-1, 1)   # ε = y - H * mu_pred, shape (m, 1)
+        S = H @ Sigma_pred @ H.T + R
+        K_std = Sigma_pred @ H.T @ np.linalg.inv(S)       # Standard (unscaled) Kalman gain, shape (n, m)
+
+        K_eps = K_std @ innovation                         # K * ε, shape (n, 1)
+
+        # Eq. 9: mean update scaled by responsibility
+        mu_new = (mu_pred.reshape(-1, 1) + lam * K_eps).flatten()
+
+        # Eq. 10: within-component variance + between-component variance
+        Sigma_new = (np.eye(len(mu)) - lam * K_std @ H) @ Sigma_pred \
+                + lam * (1.0 - lam) * K_eps @ K_eps.T
+
+        return mu_new, Sigma_new
+    else:
+        # If the observation is masked, skip the update and return the prediction.
+        return mu_pred, Sigma_pred
+
+
+def kalman_fit_multicontext(y, contexts, n_ctx, n_iter):
+    """
+    Fit separate Kalman filters for each context using masked arrays.
+
+    For each context c, the full-length observation sequence is passed to
+    pykalman with all timesteps where ``contexts != c`` masked out.  pykalman
+    runs the prediction step (advancing the state via A and Q) at *every*
+    timestep but only performs a measurement update at unmasked ones. 
+
+    Parameters
+    ----------
+    y : np.array
+        1D array of observations of length T
+    contexts : np.array
+        1D integer array of shape (T,) indicating the active context at each
+        timestep (values in [0, n_ctx-1])
+    n_ctx : int
+        Number of distinct contexts
+    n_iter : int
+        Number of EM iterations for each Kalman filter
+
+    Returns
+    -------
+    kfs : list
+        List of fitted KalmanFilter objects, one per context
+    """
+    kfs = []
+    y_ctx_masked = [] # List of y with context-specific masks
+    for c in range(n_ctx):
+        # Mask every timestep where context c is NOT active.
+        # pykalman skips the observation update at masked steps but still
+        # advances the state, so Q is estimated and applied at the correct
+        # 1-step timescale across gaps.
+        y_masked = np.ma.array(y, mask=(contexts != c))
+        y_ctx_masked.append(y_masked)
+
+        n_active = int((contexts == c).sum())
+        if n_active >= MIN_OBS_FOR_EM:
+            kf = KalmanFilter(
+                observation_matrices=np.array([[1.0, 0.0]]),
+                n_dim_state=2,
+                n_dim_obs=1,
+            )
+            kf_fitted = kf.em(y_masked, n_iter=n_iter, em_vars='all')
+            kfs.append(kf_fitted)
+        else:
+            # Fallback: use default parameters if too few active observations
+            kf = KalmanFilter(
+                transition_matrices=np.array([[0.9, 0.1], [0.0, 1.0]]), # TODO: set this better!!!!!
+                observation_matrices=np.array([[1.0, 0.0]]),
+                n_dim_state=2,
+                n_dim_obs=1,
+            )
+            kfs.append(kf)
+    # return kfs, y_ctx_masked
+    return kfs
+
+
+def kalman_filtering_multicontext(y, prior_context_probabilities, kfs):
+    """Filter a sequence of observations using Kalman filter objects already instantiated.
+    
+    Note: alternative skipping use of lambda 
+    for c in range(n_ctx):
+        states_means_filt[c], states_covariances_filt[c] = kfs[c].filter(y_ctx_masked[c])
+    # TODO: verify that in case lambda=1, this algorithm returns the same as applying single ctx KF separately     
+
+    Returns:
+        states_means_filt : np.array [C,T]
+            Filtered mean estimates for each context
+        states_vars_filt : np.array [C,T]
+            Filtered covariance estimates for each context
+    """
+    T = len(y)
+    n_ctx = prior_context_probabilities.shape[1]  # [T, C]
+
+    # Instantiate and initialize filtered observation mean and variance arrays
+    states_means_filt,       states_vars_filt       = np.ones((T, n_ctx)) * np.nan, np.ones((T, n_ctx)) * np.nan # [T, C]
+    states_means_filt[0, :], states_vars_filt[0, :] = _init_context_states(kfs)
+    
+    # Run all KFs on the full observation sequence in parallel. Each KF maintains its own state trajectory.
+    for c in range(n_ctx):
+        # Get parameters of current context
+        A, Q, H, R = _get_kf_params(kfs[c])
+
+        # Filter the sequence time step by time step
+        for t in range(1, T):            
+            states_means_filt[t, c], states_vars_filt[t, c] = kalman_step_multicontext(states_means_filt[t-1, c], states_vars_filt[t-1, c], y[t], A, Q, H, R, lam=prior_context_probabilities[t, c])
+
+    return states_means_filt, states_vars_filt
+
+
+def kalman_fit_filter_multicontext(y, prior_context_probabilities, n_iter):
+    """
+    Multi-context Kalman filter with soft context assignments (priors).
     
     Fits a separate KF per context using observations where that context is most
-    responsible, then runs all KFs in parallel and combines estimates weighted by λ.
+    probable, then runs all KFs in parallel and combines filtered states estimates weighted by λ.
     
     Parameters
     ----------
     y : np.array
         1D array of observations of length T
-    responsibilities : np.array
-        Context probabilities of shape [T, C] where C is number of contexts.
-        responsibilities[t, c] = P(context=c | observation at time t)
-        Each row should sum to 1.
+    prior_context_probabilities : np.array
+        Context priors of shape [T, C] where C is number of contexts.
+        prior_context_probabilities[t, c] = P(context=c | rule/design, time t)
+        Used to weight KF updates. Each row should sum to 1.
     n_iter : int
         Number of EM iterations for fitting each Kalman filter
     
     Returns
     -------
-    y_hat : np.array
-        Weighted aggregate filtered estimates [T]
-    s_hat : np.array
-        Weighted aggregate standard deviations [T]
+    states_means_filt : np.array
+        Weighted aggregate filtered estimates means [T]
+    states_covariances_filt : np.array
+        Weighted aggregate filtered estimates covariances [T]
     kfs : list
         List of fitted KalmanFilter objects, one per context
-    
-    Notes
-    -----
-    The key insight is that we separate FITTING from INFERENCE:
-    - Fitting: Each KF is fit on observations where its context is dominant (argmax)
-    - Inference: All KFs run on ALL observations, outputs weighted by λ
     """
-    T = len(y)
-    n_ctx = responsibilities.shape[1]  # [T, C]
+    n_ctx = prior_context_probabilities.shape[1]  # [T, C]
     
-    # Step 1: Convert soft responsibilities to hard assignments for fitting
-    contexts = np.argmax(responsibilities, axis=1)  # [T] integer array
+    # Convert soft probabilities to hard assignments for fitting
+    contexts = np.argmax(prior_context_probabilities, axis=1)  # [T] integer array
     
-    # Step 2: Fit a KF for each context using the existing helper
-    kfs = _fit_context_kfs(y, contexts, n_ctx, n_iter)
+    # Fit a KF for each context using the existing helper
+    kfs = kalman_fit_multicontext(y, contexts, n_ctx, n_iter)
     
-    # Step 3: Run all KFs on the full observation sequence in parallel.
-    # Each KF maintains its own state trajectory.
-    per_ctx_means = np.zeros((n_ctx, T))  # [C, T]
-    per_ctx_vars = np.zeros((n_ctx, T))   # [C, T]
+    # Filter the sequence with all KFs in parallel and combine estimates weighted by context probabilities
+    states_means_filt, states_vars_filt = kalman_filtering_multicontext(y, prior_context_probabilities, kfs)
 
-    mus, Sigmas = _init_context_states(kfs)
+    return states_means_filt, states_vars_filt, kfs
+   
 
-    for t in range(T):
-        for c in range(n_ctx):
-            A, Q, H, R = _get_kf_params(kfs[c])
-            # Responsibility-gated update: scale the Kalman gain by λ[t,c].
-            # This matches the masked-array EM fitting where KF c only received
-            # observation updates when context c was dominant.
-            mus[c], Sigmas[c], _, _ = _kalman_step(mus[c], Sigmas[c], y[t], A, Q, H, R, lam=responsibilities[t, c])
-            # Store filtered observation estimate
-            per_ctx_means[c, t] = (H @ mus[c])[0]
-            per_ctx_vars[c, t] = (H @ Sigmas[c] @ H.T + R)[0, 0]
-
-    # Step 4: Aggregate across contexts weighted by responsibilities.
-    # Uses law of total expectation/variance via _aggregate_contexts.
-    y_hat = np.zeros(T)
-    s_hat = np.zeros(T)
-    for t in range(T):
-        y_hat[t], s_hat[t] = _aggregate_contexts(per_ctx_means[:, t], per_ctx_vars[:, t], responsibilities[t, :])
-
-    return y_hat, s_hat, kfs
-
-
-def kalman_fit_predict_multicontext(y, responsibilities, n_iter):
+def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_iter, return_per_ctx=False):
     """
-    Multi-context Kalman filter returning ONE-STEP-AHEAD predictions.
+    Multi-context Kalman filter returning one-step-ahead predictions.
     
     Like kalman_fit_multicontext but returns predictions for y[t+1] given y[0:t].
     
@@ -499,18 +558,19 @@ def kalman_fit_predict_multicontext(y, responsibilities, n_iter):
     ----------
     y : np.array
         1D array of observations of length T
-    responsibilities : np.array
-        Context probabilities of shape [T, C]
+    prior_context_probabilities : np.array
+        Context priors of shape [T, C]
     n_iter : int
         Number of EM iterations
-    kalman_fit_predict_multicontext
+    
     Returns
     -------
     y_hat : np.array
-        One-step-ahead predictions of length T - MIN_OBS_FOR_EM.
-        y_hat[t] is the prediction for y[t + MIN_OBS_FOR_EM] given y[0:t + MIN_OBS_FOR_EM].
+        One-step-ahead predictions of length T (previously: length T-MIN_OBS_FOR_EM).
+        y_hat[t] is the prediction for y[t] given y[0:t]. 
+        (previously: y_hat[t] is the prediction for y[t+MIN_OBS_FOR_EM] given y[0:t+MIN_OBS_FOR_EM].)
     s_hat : np.array
-        Prediction standard deviations of length T - MIN_OBS_FOR_EM.
+        Prediction standard deviations of length T (previously: length T-MIN_OBS_FOR_EM)..
     kfs : list
         Fitted KalmanFilter objects
     
@@ -522,74 +582,97 @@ def kalman_fit_predict_multicontext(y, responsibilities, n_iter):
     kalman_fit_predict_multicontext return predictions aligned with y[MIN_OBS_FOR_EM:].
     """
     T = len(y)
-    n_ctx = responsibilities.shape[1]
+    n_ctx = prior_context_probabilities.shape[1]
     
     # Output arrays aligned with y[MIN_OBS_FOR_EM:] for consistency with single-context version
-    y_hat = np.zeros(T - MIN_OBS_FOR_EM)
-    s_hat = np.zeros(T - MIN_OBS_FOR_EM)
-    
-    # Get contexts as most probable contexts from responsibilites (used for fitting)
-    contexts = np.argmax(responsibilities, axis=1)
-    
-    # Fit KFs using the existing helper
-    kfs = _fit_context_kfs(y, contexts, n_ctx, n_iter)
-    
-    # Per-context state tracking
-    mus, Sigmas = _init_context_states(kfs)
+    per_ctx_pred_means = np.ones((T, n_ctx)) * np.nan
+    per_ctx_pred_vars = np.ones((T, n_ctx)) * np.nan
+    # y_hat = np.zeros(T - MIN_OBS_FOR_EM)
+    # s_hat = np.zeros(T - MIN_OBS_FOR_EM)
+    y_hat = np.ones(T) * np.nan
+    s_hat = np.ones(T) * np.nan
 
+    kfs_fitted = [None for i in range(n_ctx)]
+    A, Q, H, R = None, None, None, None
+    
+    # Get contexts as most probable contexts from context probabilities (used for fitting)
+    contexts = np.argmax(prior_context_probabilities, axis=1)
+
+    y_ctx_masked = [] # List of y with context-specific masks
+    for c in range(n_ctx):
+        y_ctx_masked.append(np.ma.array(y, mask=(contexts != c))) # Mask (mask==True) when y[t] does not belong to context c (ctx[t]!=c)
+            
     # Process all timesteps, but only store predictions starting from MIN_OBS_FOR_EM.
-    # Update each context KF weighted by its responsibility at time t.
-    # This matches how each KF was *fitted*: _fit_context_kfs uses masked arrays so
+    # Update each context KF weighted by the context's probability at time t.
+    # This matches how each KF was *fitted*: kalman_fit_multicontext uses masked arrays so
     # KF c only received observation updates at timesteps where context c was active.
-    # Using full updates for all KFs here (regardless of context) would contaminate
-    # "sleeping" KFs with wrong-context observations, biasing their state estimates.
     for t in range(T - 1):
-        per_ctx_pred_means = np.zeros(n_ctx)
-        per_ctx_pred_vars = np.zeros(n_ctx)
+    # for t in range(MIN_OBS_FOR_EM - 1, T - 1): # --> first indices skipped context-specifically, see "if... continue" below
+
+        # # Output index offset by MIN_OBS_FOR_EM - 1
+        # out_idx = t - (MIN_OBS_FOR_EM - 1)
 
         for c in range(n_ctx):
-            A, Q, H, R = _get_kf_params(kfs[c])
-            # Responsibility-gated update: λ=1 → standard update; λ=0 → predict only.
-            # This keeps the inference consistent with the masked-array EM fitting.
-            mus[c], Sigmas[c], _, _ = _kalman_step(mus[c], Sigmas[c], y[t], A, Q, H, R, lam=responsibilities[t, c])
 
-            # ONE-STEP-AHEAD: predict y[t+1] from updated state
-            mu_next = A @ mus[c]
-            Sigma_next = A @ Sigmas[c] @ A.T + Q
-            per_ctx_pred_means[c] = (H @ mu_next)[0]
-            per_ctx_pred_vars[c] = (H @ Sigma_next @ H.T + R)[0, 0]
+            # Only start the process if number of unmasked observations for context c until and including t) >= MIN_OBS_FOR_EM, otherwise we won't have enough observations to fit the KF for context c. This is consistent with the single-context version where we also start predictions at index MIN_OBS_FOR_EM.
+            if np.sum(~y_ctx_masked[c][:t+1].mask) < MIN_OBS_FOR_EM:
+                continue
 
-        # Only store predictions for t+1 >= MIN_OBS_FOR_EM (i.e., t >= MIN_OBS_FOR_EM - 1)
-        if t >= MIN_OBS_FOR_EM - 1:
-            out_idx = t - (MIN_OBS_FOR_EM - 1)
-            # Aggregate using context belief at time t (the last observed timestep).
-            # Using responsibilities[t+1] would be an oracle leak: it would use the
-            # true ground-truth context at the *future* timestep we are predicting.
-            # responsibilities[t] is causally correct: it reflects what we know at t.
-            y_hat[out_idx], s_hat[out_idx] = _aggregate_contexts(
-                per_ctx_pred_means, per_ctx_pred_vars, responsibilities[t, :]
-            )
+            # IF current obs is masked in current context, skip EM and reuse last fitted parameters to run the filter (besides, this will only propagate the prediction step)
+            # If not, update the KF with EM
+            if not np.ma.is_masked(y_ctx_masked[c][t]) or kfs_fitted[c] is None: 
+                # EM-fit Kalman filter for current context on observations y[0:t+1] (indices 0 to t inclusive) and filter
+                kfs_fitted[c] = kalman_fit(y_ctx_masked[c][:t+1], n_iter)   
+            
+            # Get fitted parameters for one-step-ahead prediction (with defaults for None)
+            A, Q, H, R = _get_kf_params(kfs_fitted[c])
+            state_means_filt, state_covariances_filt = kalman_filtering(y_ctx_masked[c][:t+1], kfs_fitted[c]) # NOTE: using this rather than below as no need to process BOTH contexts while we're only considering one atm
+            # states_means_filt, states_covariances_filt = kalman_filtering_multicontext(y_ctx_masked[c][:t+1], prior_context_probabilities, kfs)
+            # Or use: kalman_step_multicontext(per_ctx_state_means_filt, per_ctx_state_covariances_filt, y_ctx_masked[c][:t+1], A, Q, H, R, lam=prior_context_probabilities[t, c])
+            
+            # Use the LAST filtered state (index -1, which corresponds to time t) to predict y[t+1]
+            x_last = state_means_filt[-1]  # Last filtered state mean
+            P_last = state_covariances_filt[-1]  # Last filtered state covariance
+            
+            ### One-step-ahead prediction for y[t+1] using the KF equations + last fitted parameters:
+            # One-step-ahead state prediction: x_{t+1|t} = A @ x_{t|t}
+            x_next_pred = A @ x_last
+            P_next_pred = A @ P_last @ A.T + Q 
+            
+            #  One-step-ahead observation prediction: y_{t+1|t} = H @ x_{t+1|t}
+            per_ctx_pred_means[t+1, c] = (H @ x_next_pred)[0]
+            per_ctx_pred_vars[t+1, c] = (H @ P_next_pred @ H.T + R)[0, 0]
 
-    return y_hat, s_hat, kfs
+
+        # Aggregate using context belief at time t (the last observed timestep).
+        # y_hat[out_idx], s_hat[out_idx] = _aggregate_contexts(
+        y_hat[t+1], s_hat[t+1] = _aggregate_contexts(
+            per_ctx_pred_means[t+1,:], per_ctx_pred_vars[t+1,:], prior_context_probabilities[t, :]
+        )
+
+    if return_per_ctx:
+        return y_hat, s_hat, kfs_fitted, per_ctx_pred_means, per_ctx_pred_vars
+    else:
+        return y_hat, s_hat, kfs_fitted
 
 
-def kalman_fit_multicontext_multirule(y, per_rule_responsibilities, rule_responsibilities, n_iter):
+def kalman_fit_filter_multicontext_multirule(y, per_rule_prior_context_probabilities, prior_rule_probabilities, n_iter, return_per_ctx=False):
     """Multi-context Kalman filter with an additional rule layer.
 
     Extends :func:`kalman_fit_multicontext` by letting each rule carry its own
-    set of context responsibilities.  The marginalized context probability at time t
+    set of context probabilities.  The marginalized context probability at time t
     is obtained by marginalising over rules::
 
         P(c | t) = sum_r  P(rule=r | t) * P(c | rule=r, t)
 
-    These marginalized responsibilities are then used identically to the
-    ``responsibilities`` argument of :func:`kalman_fit_multicontext`.
+    These marginalized probabilities are then used identically to the
+    ``probabilities`` argument of :func:`kalman_fit_multicontext`.
 
     Parameters
     ----------
     y : np.array, shape [T]
         Observation sequence.
-    per_rule_responsibilities : np.array, shape [R, T, C]
+    per_rule_probabilities : np.array, shape [R, T, C]
         Context responsibilities conditioned on each rule:
         per_rule_responsibilities[r, t, c] = P(context=c | rule=r, t).
     rule_responsibilities : np.array, shape [T, R]
@@ -608,16 +691,20 @@ def kalman_fit_multicontext_multirule(y, per_rule_responsibilities, rule_respons
     marg_resp : np.array, shape [T, C]
         The marginalized context responsibilities used internally.
     """
-    marg_resp = _compute_marginal_context_responsibilities(per_rule_responsibilities, rule_responsibilities)
-    y_hat, s_hat, kfs = kalman_fit_multicontext(y, marg_resp, n_iter)
-    return y_hat, s_hat, kfs, marg_resp
+    marg_ctx_prob = _compute_marginal_context_probabilities(per_rule_prior_context_probabilities, prior_rule_probabilities)
+    if return_per_ctx:
+        y_hat, s_hat, kfs, per_ctx_pred_means, per_ctx_pred_vars = kalman_fit_filter_multicontext(y, marg_ctx_prob, n_iter, return_per_ctx=return_per_ctx) # TODO: check if appropriate
+        return y_hat, s_hat, kfs, marg_ctx_prob, per_ctx_pred_means, per_ctx_pred_vars
+    else:
+        y_hat, s_hat, kfs = kalman_fit_filter_multicontext(y, marg_ctx_prob, n_iter, return_per_ctx=return_per_ctx)
+        return y_hat, s_hat, kfs, marg_ctx_prob
 
 
-def kalman_fit_predict_multicontext_multirule(y, per_rule_responsibilities, rule_responsibilities, n_iter):
-    """Multi-context KF with a rule layer, returning ONE-STEP-AHEAD predictions.
+def kalman_online_fit_predict_multicontext_multirule(y, per_rule_prior_context_probabilities, prior_rule_probabilities, n_iter, return_per_ctx=False):
+    """Multi-context KF with a rule layer, returning one-step-ahead predictions.
 
     Extends :func:`kalman_fit_predict_multicontext` by supporting R rules, each
-    with its own context responsibilities.  Marginalized context probabilities are
+    with its own context priors.  Marginalized context probabilities are
     computed by marginalising over rules::
 
         P(c | t) = sum_r  P(rule=r | t) * P(c | rule=r, t)
@@ -628,11 +715,11 @@ def kalman_fit_predict_multicontext_multirule(y, per_rule_responsibilities, rule
     ----------
     y : np.array, shape [T]
         Observation sequence.
-    per_rule_responsibilities : np.array, shape [R, T, C]
-        Context responsibilities conditioned on each rule:
-        per_rule_responsibilities[r, t, c] = P(context=c | rule=r, t).
-    rule_responsibilities : np.array, shape [T, R]
-        Rule probabilities: rule_responsibilities[t, r] = P(rule=r | t).
+    per_rule_prior_context_probabilities : np.array, shape [R, T, C]
+        Context priors conditioned on each rule:
+        per_rule_prior_context_probabilities[r, t, c] = P(context=c | rule=r, t).
+    prior_rule_probabilities : np.array, shape [T, R]
+        Rule priors: prior_rule_probabilities[t, r] = P(rule=r | t).
     n_iter : int
         Number of EM iterations.
 
@@ -647,169 +734,50 @@ def kalman_fit_predict_multicontext_multirule(y, per_rule_responsibilities, rule
     marg_resp : np.array, shape [T, C]
         The marginalized context responsibilities used internally.
     """
-    marg_resp = _compute_marginal_context_responsibilities(per_rule_responsibilities, rule_responsibilities)
-    y_hat, s_hat, kfs = kalman_fit_predict_multicontext(y, marg_resp, n_iter)
-    return y_hat, s_hat, kfs, marg_resp
+    marg_ctx_prob = _compute_marginal_context_probabilities(per_rule_prior_context_probabilities, prior_rule_probabilities)
+    if return_per_ctx:
+        y_hat, s_hat, kfs, per_ctx_pred_means, per_ctx_pred_vars = kalman_online_fit_predict_multicontext(y, marg_ctx_prob, n_iter, return_per_ctx=return_per_ctx)
+        return y_hat, s_hat, kfs, marg_ctx_prob, per_ctx_pred_means, per_ctx_pred_vars
+    else:
+        y_hat, s_hat, kfs = kalman_online_fit_predict_multicontext(y, marg_ctx_prob, n_iter, return_per_ctx=return_per_ctx)
+        return y_hat, s_hat, kfs, marg_ctx_prob
 
 
+############################
 
-
-
-##### BATCH VERSIONS
-
-def kalman_batch(ys, taus, mu_lims, C, Qs, Rs, x0s):
-    y_hats, s_hats = [], []
-    for y, tau, mu_lim, Q, R, y0 in zip(ys, taus, mu_lims, Qs, Rs, x0s):
-        y_hat, s_hat = kalman_tau(y, tau, mu_lim, C, Q, R, y0)
-        y_hats.append(y_hat)
-        s_hats.append(s_hat)
-    return np.stack([batch for batch in y_hats], axis=0), np.stack([batch for batch in s_hats], axis=0)
-
-
-def kalman_fit_batch(ys, n_iter, predict=False):
+def likelihood_observation(y, mu, sigma):
+    """Evaluate likelihood for an observation y of belonging to a normal distribution defined by my and sigma
+    If y is an array, and mu and sigma are scalars, all observations of y will be evaluated under the same distribution defined by mu and sigma.
+    If y is an array, but mu and sigma are arraus, each observation within y will be evaluated under the distribution defined by each value from mu and sigma, respectively.
     """
-    Batch version of kalman_fit.
-    
-    Parameters
-    ----------
-    ys : np.array
-        2D array of observations, shape (N_samples, T)
-    n_iter : int
-        Number of EM iterations
-    predict : bool
-        If False, return filtered estimates (y_hat[t] is estimate after seeing y[0:t])
-                  Output shape: (N_samples, T)
-        If True, return one-step-ahead predictions (y_hat[t] predicts y[t+1])
-                  Output shape: (N_samples, T-1)
-    
-    Returns
-    -------
-    y_hats : np.array
-        Shape (N_samples, T) if predict=False, (N_samples, T-1) if predict=True
-    s_hats : np.array
-        Shape (N_samples, T) if predict=False, (N_samples, T-1) if predict=True (standard deviations)
+    likelihood = (1 / np.sqrt(2 * np.pi * sigma)) * np.exp(-0.5 * (y - mu)**2 / sigma)
+    return likelihood
+
+def likelihood_observation_cond_ctx(y, c, t, n_iter, prior_ctx_probs, prior_rule_probs=None):
+    """Compute likelihood of observation conditional on belonging to a certain context c, at a certain time step t
+    I.e. evaluate:
+        P(y_t | ctx = c, y_{1:t-1}) = N(y_t; hat{y}_t^c, hat{Sigma}_t^c) 
+        
+    If y_hat, s_hat, kfs, per_ctx_pred_means, per_ctx_pred_vars = kalman_online_fit_predict_...()
+    Then  hat{y}^c = per_ctx_pred_means[c],  hat{y}^c = per_ctx_pred_vars[c]
+
+    NOTE: in the context of one-step-ahead prediction
     """
-    fit_func = kalman_fit_predict if predict else kalman_fit
-    desc = "Samples fit to KF by EM" + (" (predict)" if predict else "")
+    if prior_rule_probs is None:
+        _, _, _, per_ctx_pred_means, per_ctx_pred_vars = kalman_online_fit_predict_multicontext(y, prior_ctx_probs, n_iter, return_per_ctx=True)
+    else:
+        _, _, _, per_ctx_pred_means, per_ctx_pred_vars = kalman_online_fit_predict_multicontext_multirule(y, prior_ctx_probs, prior_rule_probs, n_iter, return_per_ctx=True)
     
-    y_hats, s_hats = [], []
-    for y in tqdm(ys, desc=desc):
-        y_hat, s_hat, _ = fit_func(y, n_iter)
-        y_hats.append(y_hat)
-        s_hats.append(s_hat)
-    return np.stack(y_hats, axis=0), np.stack(s_hats, axis=0)
-
-
-# Convenience aliases for backward compatibility
-def kalman_fit_predict_batch(ys, n_iter):
-    """Batch version of kalman_fit_predict (returns one-step-ahead predictions)."""
-    return kalman_fit_batch(ys, n_iter, predict=True)
-
-
-def kalman_fit_multicontext_batch(ys, responsibilities_batch, n_iter, predict=False):
-    """
-    Batch version of multi-context Kalman filter.
-    
-    Parameters
-    ----------
-    ys : np.array
-        2D array of observations, shape [N_samples, T]
-    responsibilities_batch : np.array
-        3D array of context probabilities, shape [N_samples, T, C]
-    n_iter : int
-        Number of EM iterations
-    predict : bool
-        If False: return filtered estimates [N_samples, T]
-        If True: return one-step-ahead predictions [N_samples, T-1]
-    
-    Returns
-    -------
-    y_hats : np.array
-        Filtered/predicted estimates
-    s_hats : np.array
-        Standard deviations
-    """
-    fit_func = kalman_fit_predict_multicontext if predict else kalman_fit_multicontext
-    desc = "Multi-context KF by EM" + (" (predict)" if predict else "")
-    
-    y_hats, s_hats = [], []
-    for y, resp in tqdm(zip(ys, responsibilities_batch), desc=desc, total=len(ys)):
-        y_hat, s_hat, _ = fit_func(y, resp, n_iter)
-        y_hats.append(y_hat)
-        s_hats.append(s_hat)
-    return np.stack(y_hats, axis=0), np.stack(s_hats, axis=0)
-
-
-def kalman_fit_predict_multicontext_batch(ys, responsibilities_batch, n_iter):
-    """Batch version of kalman_fit_predict_multicontext (returns one-step-ahead predictions)."""
-    return kalman_fit_multicontext_batch(ys, responsibilities_batch, n_iter, predict=True)
-
-
-def kalman_fit_multicontext_multirule_batch(
-    ys, per_rule_responsibilities_batch, rule_responsibilities_batch, n_iter, predict=False
-):
-    """Batch version of the multi-context / multi-rule Kalman filter.
-
-    Parameters
-    ----------
-    ys : np.array, shape [N, T]
-        Observation sequences.
-    per_rule_responsibilities_batch : np.array, shape [N, R, T, C]
-        Per-rule context responsibilities for each sample.
-    rule_responsibilities_batch : np.array, shape [N, T, R]
-        Rule probabilities for each sample.
-    n_iter : int
-        Number of EM iterations.
-    predict : bool
-        If False: return filtered estimates, shape [N, T].
-        If True:  return one-step-ahead predictions, shape [N, T - MIN_OBS_FOR_EM].
-
-    Returns
-    -------
-    y_hats : np.array
-        Filtered or predicted estimates.
-    s_hats : np.array
-        Corresponding standard deviations.
-    """
-    fit_func = kalman_fit_predict_multicontext_multirule if predict else kalman_fit_multicontext_multirule
-    desc = "Multi-rule/context KF" + (" (predict)" if predict else "")
-
-    y_hats, s_hats = [], []
-    for y, per_rule_resp, rule_resp in tqdm(
-        zip(ys, per_rule_responsibilities_batch, rule_responsibilities_batch),
-        desc=desc,
-        total=len(ys),
-    ):
-        y_hat, s_hat, _, _ = fit_func(y, per_rule_resp, rule_resp, n_iter)
-        y_hats.append(y_hat)
-        s_hats.append(s_hat)
-    return np.stack(y_hats, axis=0), np.stack(s_hats, axis=0)
-
-
-def kalman_fit_predict_multicontext_multirule_batch(
-    ys, per_rule_responsibilities_batch, rule_responsibilities_batch, n_iter
-):
-    """Batch one-step-ahead predictions for the multi-context / multi-rule KF."""
-    return kalman_fit_multicontext_multirule_batch(
-        ys, per_rule_responsibilities_batch, rule_responsibilities_batch, n_iter, predict=True
-    )
-    kf_fitted = kf.em(y, n_iter=n_iter, em_vars='all')
-
-    # Kalman filtering - returns filtered state estimates
-    # state_means_filt[t] is the state estimate after seeing y[0:t]
-    state_means_filt, state_covariances_filt = kf_fitted.filter(y) # TODO: check dimensions
-    
-    # return state_means_filt[:,0], state_covariances_filt[:,0,0], kf_fitted # "first component" = ?
-    return state_means_filt, state_covariances_filt, kf_fitted
+    # For a single timestep t, evaluate Gaussian likelihood:
+    likelihood = likelihood_observation(y=y[t], mu=per_ctx_pred_means[c][t], sigma=per_ctx_pred_vars[c][t])
+    return likelihood
 
 
 
 
 
-# def kalman_fit_predict_multicontext_multirule(y, responsibilities_ctx, responsibilites_rule, n_iter):
-    
-    
-#     pass
+
+
 
 
 
