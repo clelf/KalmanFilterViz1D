@@ -154,6 +154,30 @@ def _aggregate_contexts(per_ctx_means, per_ctx_vars, lambda_t):
     return y_hat, s_hat
 
 
+def contexts_to_probabilities(contexts, n_ctx):
+    """
+    Convert hard context labels to one-hot responsibilities (soft assignments).
+    
+    This function bridges the gap between generative models that produce hard
+    context labels and Kalman filter functions that expect soft responsibilities.
+    
+    Parameters
+    ----------
+    contexts : np.array
+        1D integer array of shape (T,) with values in [0, n_ctx-1]
+    n_ctx : int
+        Number of contexts
+    
+    Returns
+    -------
+    responsibilities : np.array
+        One-hot encoded array of shape (T, n_ctx) where each row sums to 1.0
+    """
+    T = len(contexts)
+    probabilities = np.zeros((T, n_ctx))
+    probabilities[np.arange(T), contexts.astype(int)] = 1.0
+    return probabilities
+
 
 def _compute_marginal_context_probabilities(per_rule_probabilities, rule_probabilities):
     """Marginalise context probabilities over rules.
