@@ -244,7 +244,7 @@ def kalman_step(y_t, kf, state_mean_prev, state_cov_prev):
     state_mean_new, state_cov_new = kf.filter_update(state_mean_prev, state_cov_prev, y_t)
     return state_mean_new, state_cov_new
 
-def kalman_fit(y, n_iter, initial_state_mean=None, initial_state_covariance=None, em_vars='all'):
+def kalman_fit(y, n_iter, initial_state_mean=None, initial_state_covariance=None, em_vars='all', observation_noise=None):
     """
     Fit a Kalman filter using EM.
     
@@ -262,12 +262,24 @@ def kalman_fit(y, n_iter, initial_state_mean=None, initial_state_covariance=None
         Which parameters EM should estimate. When a warm-start is provided, you
         typically want to exclude 'initial_state_mean' and 'initial_state_covariance'
         so EM doesn't overwrite them.
+    observation_noise : float or np.array, optional
+        If provided, fixes the observation noise (R) to this value and excludes it from EM optimization.
+        If None, allows EM to estimate observation_covariance (if included in em_vars).
 
     Elapsed time (s): 1.15, n_iter: 5, n_samples: 1000
     Elapsed time (s): 2.28, n_iter: 10, n_samples: 1000
     """
+    obs_cov = None if observation_noise is None else np.array([[observation_noise]])
+    
+    # If observation_noise is fixed, remove it from EM variables
+    if observation_noise is not None and em_vars == 'all':
+        em_vars = ['transition_matrices', 'transition_covariance']
+    elif observation_noise is not None and isinstance(em_vars, list) and 'observation_covariance' in em_vars:
+        em_vars = [v for v in em_vars if v != 'observation_covariance']
+    
     kf = KalmanFilter(
         observation_matrices=np.array([[1.0, 1.0]]),
+        observation_covariance=obs_cov,
         initial_state_mean=initial_state_mean,       # None → pykalman uses zeros
         initial_state_covariance=initial_state_covariance,  # None → pykalman uses eye
         n_dim_state=2,
@@ -588,7 +600,7 @@ def kalman_fit_filter_multicontext(y, prior_context_probabilities, n_iter):
     return states_means_filt, states_vars_filt, kfs
    
 
-def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_iter, return_per_ctx=False):
+def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_iter, return_per_ctx=False, observation_noise=None):
     """
     Multi-context Kalman filter returning one-step-ahead predictions.
     
@@ -602,6 +614,9 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
         Context priors of shape [T, C]
     n_iter : int
         Number of EM iterations
+    observation_noise : float or np.array, optional
+        If provided, fixes the observation noise (R) to this value and excludes it from EM optimization.
+        If None, allows EM to estimate observation_covariance.
     
     Returns
     -------
@@ -672,7 +687,9 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
                     n_iter,
                     initial_state_mean=mus[c],
                     initial_state_covariance=Sigmas[c],
-                    em_vars=['transition_matrices', 'transition_covariance', 'observation_covariance']
+                    em_vars=['transition_matrices', 'transition_covariance'],
+                    # em_vars=['transition_matrices', 'transition_covariance', 'observation_covariance'],
+                    observation_noise=observation_noise
                 )  
 
                 # Get fitted parameters
@@ -812,6 +829,10 @@ def likelihood_observation(y, mu, sigma):
     """
     likelihood = (1 / np.sqrt(2 * np.pi * sigma)) * np.exp(-0.5 * (y - mu)**2 / sigma)
     return likelihood
+
+
+
+    
 
 def likelihood_observation_cond_ctx(y, c, t, n_iter, prior_ctx_probs, prior_rule_probs=None):
     """Compute likelihood of observation conditional on belonging to a certain context c, at a certain time step t
