@@ -159,11 +159,21 @@ def _aggregate_contexts(per_ctx_means, per_ctx_vars, lambda_t):
     -------
     y_hat : float — weighted mean
     s_hat : float — weighted standard deviation (sqrt of total variance)
+
+    Zero-weight contexts are dropped rather than multiplied by 0, because a context that has not
+    yet warmed up carries NaN and 0 * NaN = NaN would poison the sum: an inactive context would
+    wipe out a valid prediction from the active one. A NaN in an *active* (non-zero weight)
+    context still propagates, which is intended -- those timesteps are genuinely unpredictable.
     """
-    y_hat = np.sum(lambda_t * per_ctx_means)
+    lambda_t = np.asarray(lambda_t, dtype=float)
+    per_ctx_means = np.asarray(per_ctx_means, dtype=float)
+    per_ctx_vars = np.asarray(per_ctx_vars, dtype=float)
+
+    active = lambda_t > 0
+    y_hat = np.sum(np.where(active, lambda_t * per_ctx_means, 0.0))
     within_var = per_ctx_vars
     between_var = (per_ctx_means - y_hat) ** 2
-    s_hat = np.sqrt(np.sum(lambda_t * (within_var + between_var)))
+    s_hat = np.sqrt(np.sum(np.where(active, lambda_t * (within_var + between_var), 0.0)))
     return y_hat, s_hat
 
 
@@ -263,8 +273,10 @@ def kalman_fit(y, n_iter, initial_state_mean=None, initial_state_covariance=None
         typically want to exclude 'initial_state_mean' and 'initial_state_covariance'
         so EM doesn't overwrite them.
     observation_noise : float or np.array, optional
-        If provided, fixes the observation noise (R) to this value and excludes it from EM optimization.
-        If None, allows EM to estimate observation_covariance (if included in em_vars).
+        Fixed observation noise, as a VARIANCE (R = sigma_r**2), not a standard deviation:
+        it is assigned straight to pykalman's `observation_covariance`. When provided, R is
+        held at this value and excluded from EM. When None, R must be in `em_vars` for EM to
+        estimate it -- otherwise pykalman silently leaves it at its default of 1.0.
 
     Elapsed time (s): 1.15, n_iter: 5, n_samples: 1000
     Elapsed time (s): 2.28, n_iter: 10, n_samples: 1000
@@ -615,20 +627,26 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
     n_iter : int
         Number of EM iterations
     observation_noise : float or np.array, optional
-        If provided, fixes the observation noise (R) to this value and excludes it from EM optimization.
-        If None, allows EM to estimate observation_covariance.
-    
+        Fixed observation noise, as a VARIANCE (R = sigma_r**2), not a standard deviation.
+        If provided, R is held at this value and excluded from EM. If None, EM estimates it.
+
     Returns
     -------
     y_hat : np.array
         One-step-ahead predictions of length T (previously: length T-MIN_OBS_FOR_EM).
-        y_hat[t] is the prediction for y[t] given y[0:t]. 
+        y_hat[t] is the prediction for y[t] given y[0:t].
         (previously: y_hat[t] is the prediction for y[t+MIN_OBS_FOR_EM] given y[0:t+MIN_OBS_FOR_EM].)
     s_hat : np.array
-        Prediction standard deviations of length T (previously: length T-MIN_OBS_FOR_EM)..
+        Prediction standard STANDARD DEVIATIONS of length T (sqrt of the total variance; see
+        _aggregate_contexts).
     kfs : list
         Fitted KalmanFilter objects
-    
+    per_ctx_pred_means, per_ctx_pred_vars : np.array, shape [T, C]
+        Only when return_per_ctx=True. NOTE the asymmetry with s_hat above:
+        per_ctx_pred_vars holds VARIANCES (H P H' + R), not standard deviations. Callers that
+        write these to disk under a `sigma_*` name must sqrt them first; callers that feed them
+        to likelihood_observation (which is variance-parameterized) must not.
+
     Note
     ----
     Although this function fits KFs once on all data (not refitting at each step like
@@ -649,7 +667,14 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
 
     kfs_fitted = [None for i in range(n_ctx)]
     A, Q, H, R = None, None, None, None
-    
+
+    # EM must estimate the observation noise unless we are fixing it. Leaving
+    # 'observation_covariance' out of em_vars while passing observation_noise=None means R is
+    # neither supplied nor estimated, and pykalman silently holds it at its default of 1.0.
+    em_vars = ['transition_matrices', 'transition_covariance']
+    if observation_noise is None:
+        em_vars = em_vars + ['observation_covariance']
+
     # Get contexts as most probable contexts from context probabilities (used for fitting)
     contexts = np.argmax(prior_context_probabilities, axis=1)
 
@@ -687,10 +712,9 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
                     n_iter,
                     initial_state_mean=mus[c],
                     initial_state_covariance=Sigmas[c],
-                    em_vars=['transition_matrices', 'transition_covariance'],
-                    # em_vars=['transition_matrices', 'transition_covariance', 'observation_covariance'],
+                    em_vars=em_vars,
                     observation_noise=observation_noise
-                )  
+                )
 
                 # Get fitted parameters
                 A, Q, H, R = _get_kf_params(kfs_fitted[c])
