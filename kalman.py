@@ -612,7 +612,7 @@ def kalman_fit_filter_multicontext(y, prior_context_probabilities, n_iter):
     return states_means_filt, states_vars_filt, kfs
    
 
-def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_iter, return_per_ctx=False, observation_noise=None):
+def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_iter, return_per_ctx=False, observation_noise=None, return_params=False):
     """
     Multi-context Kalman filter returning one-step-ahead predictions.
     
@@ -629,6 +629,9 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
     observation_noise : float or np.array, optional
         Fixed observation noise, as a VARIANCE (R = sigma_r**2), not a standard deviation.
         If provided, R is held at this value and excluded from EM. If None, EM estimates it.
+    return_params : bool, optional
+        If True, also return the per-timestep, per-context fitted KF parameters (A, Q, H, R)
+        used to produce each prediction. See the `params` return below.
 
     Returns
     -------
@@ -646,6 +649,15 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
         per_ctx_pred_vars holds VARIANCES (H P H' + R), not standard deviations. Callers that
         write these to disk under a `sigma_*` name must sqrt them first; callers that feed them
         to likelihood_observation (which is variance-parameterized) must not.
+    params : dict, optional
+        Only when return_params=True. Maps 'A', 'Q', 'H', 'R' to the fitted parameter
+        trajectories, each an array indexed [t, c, ...] aligned with per_ctx_pred_means:
+        params['X'][t, c] is the value of parameter X for context c that produced the
+        one-step-ahead prediction of y[t] (fitted on y[0:t]). Shapes: A, Q -> [T, C, 2, 2];
+        H -> [T, C, 1, 2]; R -> [T, C, 1, 1]. R is a VARIANCE. Entries are NaN wherever no
+        prediction exists (a context has not yet reached MIN_OBS_FOR_EM observations), and are
+        carried forward from the last fit at timesteps where that context is not re-fitted
+        (masked observation), exactly like per_ctx_pred_means/vars.
 
     Note
     ----
@@ -667,6 +679,16 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
 
     kfs_fitted = [None for i in range(n_ctx)]
     A, Q, H, R = None, None, None, None
+
+    # Per-timestep, per-context fitted parameters (only stored/returned when requested). Same
+    # NaN-then-fill / carry-forward semantics as per_ctx_pred_means: the value at [t+1, c] is
+    # the parameter set that produced the prediction of y[t+1] for context c. Shapes follow the
+    # fixed 2-state / 1-obs model (see kalman_fit): A, Q are 2x2, H is 1x2, R is 1x1.
+    if return_params:
+        param_A = np.full((T, n_ctx, 2, 2), np.nan)
+        param_Q = np.full((T, n_ctx, 2, 2), np.nan)
+        param_H = np.full((T, n_ctx, 1, 2), np.nan)
+        param_R = np.full((T, n_ctx, 1, 1), np.nan)
 
     # EM must estimate the observation noise unless we are fixing it. Leaving
     # 'observation_covariance' out of em_vars while passing observation_noise=None means R is
@@ -736,11 +758,25 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
                 #  One-step-ahead observation prediction: y_{t+1|t} = H @ x_{t+1|t}
                 per_ctx_pred_means[t+1, c] = (H @ x_next_pred)[0]
                 per_ctx_pred_vars[t+1, c] = (H @ P_next_pred @ H.T + R)[0, 0]
-            
+
+                # Record the parameters that produced this prediction (fit on y[0:t+1]).
+                if return_params:
+                    param_A[t+1, c] = A
+                    param_Q[t+1, c] = Q
+                    param_H[t+1, c] = H
+                    param_R[t+1, c] = R
+
             else:
                 # Re-use the last predicted value for this context:
                 per_ctx_pred_means[t+1, c] = per_ctx_pred_means[t, c]
                 per_ctx_pred_vars[t+1, c] = per_ctx_pred_vars[t, c]
+
+                # Carry the last fitted parameters forward alongside the reused prediction.
+                if return_params:
+                    param_A[t+1, c] = param_A[t, c]
+                    param_Q[t+1, c] = param_Q[t, c]
+                    param_H[t+1, c] = param_H[t, c]
+                    param_R[t+1, c] = param_R[t, c]
 
                 pass
 
@@ -751,8 +787,14 @@ def kalman_online_fit_predict_multicontext(y, prior_context_probabilities, n_ite
             per_ctx_pred_means[t+1,:], per_ctx_pred_vars[t+1,:], prior_context_probabilities[t, :] # TODO - Note: prior prior_context_probabilities[t, :] could be predicted_context_probabilities(given last context)[t+1,:]
         )
 
-    if return_per_ctx:
+    params = {'A': param_A, 'Q': param_Q, 'H': param_H, 'R': param_R} if return_params else None
+
+    if return_per_ctx and return_params:
+        return y_hat, s_hat, kfs_fitted, per_ctx_pred_means, per_ctx_pred_vars, params
+    elif return_per_ctx:
         return y_hat, s_hat, kfs_fitted, per_ctx_pred_means, per_ctx_pred_vars
+    elif return_params:
+        return y_hat, s_hat, kfs_fitted, params
     else:
         return y_hat, s_hat, kfs_fitted
 
