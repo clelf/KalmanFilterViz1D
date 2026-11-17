@@ -1,7 +1,7 @@
 import numpy as np
 from tqdm import tqdm
 from pykalman import KalmanFilter
-from kalman_core import _aggregate_contexts
+from .kalman_core import _aggregate_contexts
 
 
 # Minimum observations needed for EM algorithm (n_dim_state + 1)

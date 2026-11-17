@@ -1,5 +1,5 @@
 import numpy as np
-from kalman_core import _aggregate_contexts
+from .kalman_core import _aggregate_contexts
 
 
 # Single step filtering
